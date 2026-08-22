@@ -1,0 +1,853 @@
+/**
+ * RightSidebarShell —— 右侧栏内容容器(TabBar + TabBody),挂在外壳 aside 之内。
+ *
+ * Phase 3 切换:渲染从 placeholder 改为 **plugin registry 驱动** ——
+ *   - 每个 tab 通过 `getTabKind(kind).TabBody` 渲染对应 plugin 内容;
+ *   - 多 tab 同时挂载,仅靠 CSS `hidden` 切换可见性(对齐 TabKindPlugin 接口注释
+ *     "display:none 切换可见性,不卸载"),避免切顶层 tab 时 webview/编辑器 state
+ *     丢失或重新挂载抖动;
+ *   - plugin TabBody 收 `{ state, ctx }`,ctx 内 `patchState` 走 store.patchTabState
+ *     乐观更新 + IPC 持久化;`workdir` 由 host(MainLayout)推上来。
+ *
+ * Phase 3 同步:Shell 顶层 import `./plugins`,触发各 plugin 的 import-side-effect
+ * 注册(`registerTabKind`)。后续新 plugin 只需在 plugins/index.ts 加一行 import。
+ *
+ * Phase 2 简化保留:错误打日志、所有 IPC 失败本地回滚 + log(无 toast),Phase 7 收尾接 toast。
+ *
+ * sessionId / workdir 由 host 透:
+ *   - sessionId 为 null = 不在 cc-agent 路由,Shell 渲染空状态,store 不工作;
+ *   - workdir 为空串 = remote session 或还没解析,plugin 自行降级渲染占位。
+ */
+
+import {
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { createLogger } from '@/lib/logger';
+import { isSecondaryWindow } from '@/lib/secondaryWindow';
+import { useAppShortcut } from '@/hooks/useAppShortcut';
+import { useMacFullscreen } from '@/hooks/useMacFullscreen';
+import { RightSidebarDetach } from '@/components/layout/RightSidebarDetach';
+import { RightSidebarMaximize } from '@/components/layout/RightSidebarMaximize';
+import { RightSidebarToggle } from '@/components/layout/RightSidebarToggle';
+import { CHROME_ACTIONS_GEOMETRY } from '@/components/layout/chromeActionsGeometry';
+import { TabBar, TabStrip } from './TabBar';
+import { EmptyState } from './EmptyState';
+import { getTabKind, hydrateTabState } from './registry';
+import {
+  addOrFocusSingletonTab,
+  addTab,
+  closeTab,
+  ensureHydrated,
+  getBucket,
+  patchTabState,
+  reorderTabs,
+  setActiveTab,
+  setTabCloseInterceptor,
+  subscribe,
+} from './store';
+import type { TabKindHostContext, TabKindId, TabState } from './types';
+// Side-effect import:触发各 plugin 模块顶层 registerTabKind(...)。Phase 3 注册
+// file-browser;Phase 5 注册 web-browser。Shell 不直接消费 plugin 实例,只通过
+// getTabKind 查 registry。
+import './plugins';
+import { initRsbBrowserBridge } from './lib/rsbBrowserBridge';
+import { initIOSSimulatorFocusBridge } from './lib/iosSimulatorFocusBridge';
+import { initPopupRouter, setPopupFallbackSession } from './lib/popupRouter';
+import { TabBodyErrorBoundary } from './TabBodyErrorBoundary';
+import { useInstalledGhosts } from '@/cindy-brain/useInstalledGhosts';
+import {
+  isIOSSimulatorPluginAvailable,
+  mergeAvailableTabOrder,
+  projectAvailableTabs,
+} from './iosSimulatorPluginAvailability';
+
+const log = createLogger('rightSidebar.shell');
+const EMPTY_TAB_ID_SET = new Set<string>();
+/**
+ * Mac 合并顶栏右端 spacer 宽度，对应 MainLayout 固定唤起按钮：28px 按钮 + 8px 右距。
+ * detach / maximize / 收起均属于面板自身，直接渲染在本顶栏中。
+ */
+const MAC_HEADER_ACTION_SPACER_PX = 36;
+type RightTabDirection = 'prev' | 'next';
+
+interface RightSidebarShellProps {
+  /**
+   * 当前 cc-agent session id;由 MainLayout 透传(CCAgentSessionView ownsRoute 时声明)。
+   * null = 尚无激活会话(或不在 cc-agent 路由),store 不工作,Shell 渲染空状态。
+   */
+  sessionId: string | null;
+  /**
+   * 当前 cc-agent session 的 workingDir;空串 = remote session 或尚未解析,plugin 自行渲染占位。
+   * file-browser plugin 据此驱动文件树 / 内容预览。
+   */
+  workdir: string;
+  /** 非空 = SSH remote 会话(workdir 为远端路径);见 TabKindHostContext.remoteHostId。 */
+  remoteHostId: string | null;
+  /** device-link 会话归属：null = 已确认本机，undefined = 尚未解析。 */
+  deviceLinkDeviceId?: string | null;
+  /** Pi-only product gate for Subagents navigation and detail rendering. */
+  subagentsAvailable?: boolean;
+  /** RightSidebar aside 当前是否真实展开。折叠时 keep-alive body 仍挂载但不可见。 */
+  shellVisible?: boolean;
+  isMac: boolean;
+  /**
+   * 主窗口 Mac 内嵌形态专用:true 时 Shell 顶部渲染 46px 合并顶栏(#650 起随全局 chrome 行高 50→46)(TabStrip +
+   * 右端浮层按钮让位 spacer),不再渲染 36px TabBar 行。detached 子窗口
+   * (SidebarWindowLayout)**不传**此项 —— 子窗口有自己的 46px chrome,Shell
+   * 维持旧 TabBar 行为(本期子窗口零改动)。
+   */
+  unifiedTopbar?: boolean;
+  onCloseSidebar?: () => void;
+  /** Windows 内嵌展开态的固定唤起入口；Mac 由 MainLayout 窗口级浮层承载。 */
+  onShowSidebar?: () => void;
+  onMaximize?: () => void;
+  /** maximize 态 — 用来让 TabBar 把 maximize 按钮换图标(Maximize2 ↔ Minimize2)。 */
+  isMaximized?: boolean;
+  /**
+   * 主窗口左栏完全收起且当前面板 maximize 时，右栏 unified topbar 需要为
+   * MainLayout 的浮动 ChromeActions 预留左侧 no-drag 占位；普通右栏/rail/独立
+   * 子窗口不应消费这段空间。
+   */
+  reserveLeftChromeActions?: boolean;
+  /** 工具面板处于最左 rail 邻位时，顶栏为浮动 ChromeActions 挖 no-drag 命中区并预留布局空间。 */
+  railChromeActionsHitHole?: boolean;
+  /** 「在新窗口中打开侧边栏」;仅 Win 端 TabBar 内渲染按钮(Mac 走 MainLayout 浮层)。 */
+  onDetach?: () => void;
+  /** TabBar 横带是否作为窗口拖拽区(见 TabBar 同名 prop):主窗口内嵌形态传
+   *  false(空白处 = 拖面板手势面);detached 子窗口不传,默认 true。 */
+  chromeWindowDrag?: boolean;
+  /** M2(mac 交换态):面板当前贴哪条边。'left' 且非 maximize 时合并顶栏右端
+   *  渲染真按钮(detach + maximize,面板自属控件跟面板走;折叠 toggle 恒在
+   *  MainLayout 窗口右上浮层,不下沉进面板);'right'(默认)与 maximize 撑满态
+   *  维持浮层 + 让位 spacer。仅 mac unifiedTopbar 形态消费。 */
+  panelSide?: 'left' | 'right';
+  /**
+   * 本 session 的 tab 数从 >0 变为 0(用户关掉最后一个 tab)时回调一次。
+   * host(MainLayout)据此自动收起右侧栏。只在「关闭动作」触发 —— 展开一个本就
+   * 无 tab 的 session 不会触发(见下方 effect 的 prev>0 判据)。detached 子窗口不传。
+   */
+  onAllTabsClosed?: () => void;
+}
+
+export function RightSidebarShell({
+  sessionId,
+  workdir,
+  remoteHostId,
+  deviceLinkDeviceId,
+  subagentsAvailable,
+  shellVisible = true,
+  isMac,
+  unifiedTopbar = false,
+  onCloseSidebar,
+  onShowSidebar,
+  onMaximize,
+  isMaximized,
+  onDetach,
+  chromeWindowDrag = true,
+  panelSide = 'right',
+  onAllTabsClosed,
+  reserveLeftChromeActions = false,
+  railChromeActionsHitHole = false,
+}: RightSidebarShellProps) {
+  const { isFullscreen } = useMacFullscreen();
+  const chromeActionsLeft =
+    isMac && !isFullscreen
+      ? CHROME_ACTIONS_GEOMETRY.macTrafficLightLeft
+      : CHROME_ACTIONS_GEOMETRY.defaultLeft;
+  // unifiedTopbar 本身有 px-2(8px) 左内边距。加上 chromeActionsLeft 后，
+  // spacer 的布局起点正好落在 ChromeActions 簇之前，并在簇后保留 8px 呼吸间距。
+  const leftChromeActionsSpacerWidth =
+    unifiedTopbar && reserveLeftChromeActions
+      ? chromeActionsLeft + CHROME_ACTIONS_GEOMETRY.clusterWidth
+      : 0;
+  // rail 邻位时浮动 ChromeActions 从工具面板左缘开始。命中洞保持 absolute
+  // 对齐窗口坐标；另加正常流中的 spacer，把 TabStrip 推到按钮簇之后。
+  const railChromeActionsSpacerWidth =
+    unifiedTopbar && !isFullscreen && railChromeActionsHitHole
+      ? CHROME_ACTIONS_GEOMETRY.clusterWidth
+      : 0;
+  const { t } = useTranslation();
+  const installedGhosts = useInstalledGhosts();
+  const iosSimulatorPluginAvailable = useMemo(
+    // Session secondary windows do not own the Main/RSB capability family and
+    // intentionally skip the Host focus bridge. Hide (but preserve) persisted
+    // Simulator tabs there instead of exposing an authorization action that
+    // can never succeed.
+    () => !isSecondaryWindow() && isIOSSimulatorPluginAvailable(installedGhosts),
+    [installedGhosts],
+  );
+
+  // RSB browser bridge (Phase 2):在 Shell 整个生命周期内只 init 一次。bridge 内部
+  // 自带 idempotent guard,strict-mode 双 effect / 重复挂载都安全。bridge 绑定
+  // pool.onRelease → main(LRU 淘汰 / 显式关 tab 同步清理 main 端 TabRegistry),
+  // 以及 main → pool 的 automation pin 同步。teardown 不在这里调 —— bridge 是
+  // 单例,Shell unmount(切 RSB / 切 session)不应解绑,否则 LRU 淘汰那条同步链
+  // 就断了。Shell 真的退出场景在 app quit,进程整体下线无所谓。
+  useEffect(() => {
+    initRsbBrowserBridge();
+    initIOSSimulatorFocusBridge();
+  }, []);
+
+  // 订阅当前 sessionId 桶变化 —— useSyncExternalStore 在 sessionId 变化时,
+  // 当次 render 就同步拿到新桶(cache miss 返回 EMPTY_BUCKET 单例,下面 hydrated
+  // 判断渲染占位);避免老 useState+effect 模式下"切到新 session 第一帧仍看到
+  // 旧 session tabs"的视觉跳变(规则 7)。
+  //
+  // getBucket cache miss 必须返回稳定 reference(EMPTY_BUCKET 单例),否则 React
+  // 用 Object.is 比对 snapshot 时报警告 / 无限重渲染 —— 见 store.ts。
+  const subscribeBucket = useCallback(
+    (onChange: () => void) =>
+      subscribe((changedSessionId) => {
+        if (changedSessionId === sessionId) onChange();
+      }),
+    [sessionId],
+  );
+  const getBucketSnapshot = useCallback(() => getBucket(sessionId), [sessionId]);
+  const bucket = useSyncExternalStore(subscribeBucket, getBucketSnapshot);
+  const previousShellVisibleRef = useRef(shellVisible);
+  const subagentsEligibilityKnown = typeof subagentsAvailable === 'boolean';
+  const subagentsEnabled = subagentsAvailable === true;
+
+  useEffect(() => {
+    // Phase 5: 推送当前焦点 RSB sessionId 给 main,让 RsbWebviewBackend 拿到。
+    // null 也推(切到非 RSB 路由时),让 main 端清掉 active session — 否则
+    // 之前的 sessionId 会成 stale 引用。隐藏的分离窗口只是预热/待命实例，不能
+    // 覆盖主窗口当前的浏览器 session。setActiveSession 失败容错(preload 未就绪)。
+    if (shellVisible) {
+      void window.electronAPI?.rsbBrowserBridge
+        ?.setActiveSession({ sessionId })
+        .catch(() => undefined);
+    } else if (previousShellVisibleRef.current) {
+      void window.electronAPI?.rsbBrowserBridge
+        ?.setActiveSession({ sessionId: null })
+        .catch(() => undefined);
+    }
+    previousShellVisibleRef.current = shellVisible;
+    if (!sessionId) return;
+    // 首次访问该 sessionId 时触发 IPC list 拉取;命中 cache 直接 noop。
+    // 完成后 setBucket → notify → subscribeBucket 唤醒 useSyncExternalStore 重渲染。
+    void ensureHydrated(sessionId).catch((err) => {
+      log.error('ensureHydrated failed', { sessionId, err });
+    });
+  }, [sessionId, shellVisible]);
+
+  // Subagents eligibility is tri-state: `undefined` while the session row is
+  // still loading, then true/false once the harness is known. Folding unknown
+  // into "unavailable" would filter a *persisted* active Subagents tab out of
+  // the projection, and the active-tab reconciliation below would immediately
+  // persist a different tab (or null) as active — the user's selection is gone
+  // by the time eligibility resolves to true. Keep the tab projected while
+  // unknown and only converge once we actually know.
+  const tabAvailability = useMemo(
+    () => ({
+      iosSimulatorAvailable: iosSimulatorPluginAvailable,
+      subagentsAvailable: subagentsEnabled || !subagentsEligibilityKnown,
+    }),
+    [iosSimulatorPluginAvailable, subagentsEligibilityKnown, subagentsEnabled],
+  );
+  const projectedTabs = useMemo(
+    () => projectAvailableTabs(bucket.tabs, bucket.activeTabId, tabAvailability),
+    [bucket.activeTabId, bucket.tabs, tabAvailability],
+  );
+  const tabs = projectedTabs.tabs;
+  const activeTabId = projectedTabs.activeTabId;
+
+  // 首帧只挂当前激活 tab。其余 tab 在浏览器空闲期逐个补挂载，随后继续按原有
+  // keep-alive 语义保留组件 / webview / 编辑器状态。这样恢复一个多 tab 会话时，
+  // 非当前面板不会与窗口首帧、presentation-ready 握手争抢主线程。
+  const [deferredMountState, setDeferredMountState] = useState<{
+    sessionId: string | null;
+    tabIds: Set<string>;
+  }>(() => ({ sessionId: null, tabIds: new Set() }));
+  const deferredMountedTabIds =
+    deferredMountState.sessionId === sessionId ? deferredMountState.tabIds : EMPTY_TAB_ID_SET;
+
+  useEffect(() => {
+    setDeferredMountState((previous) => {
+      if (previous.sessionId !== sessionId) {
+        return {
+          sessionId,
+          tabIds: activeTabId ? new Set([activeTabId]) : new Set(),
+        };
+      }
+      if (!activeTabId || previous.tabIds.has(activeTabId)) return previous;
+      const next = new Set(previous.tabIds);
+      next.add(activeTabId);
+      return { sessionId, tabIds: next };
+    });
+  }, [activeTabId, sessionId]);
+
+  useEffect(() => {
+    if (!bucket.hydrated || !sessionId) return;
+    const pendingTabIds = tabs
+      .map((tab) => tab.id)
+      .filter((tabId) => tabId !== activeTabId && !deferredMountedTabIds.has(tabId));
+    if (pendingTabIds.length === 0) return;
+
+    let cancelled = false;
+    let idleId: number | null = null;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let nextIndex = 0;
+    const scheduleNext = () => {
+      if (cancelled || nextIndex >= pendingTabIds.length) return;
+      const mountNext = () => {
+        if (cancelled) return;
+        const tabId = pendingTabIds[nextIndex++];
+        setDeferredMountState((previous) => {
+          if (previous.sessionId !== sessionId || previous.tabIds.has(tabId)) return previous;
+          const next = new Set(previous.tabIds);
+          next.add(tabId);
+          return { sessionId, tabIds: next };
+        });
+        scheduleNext();
+      };
+      if (typeof window.requestIdleCallback === 'function') {
+        idleId = window.requestIdleCallback(mountNext, { timeout: 1000 });
+      } else {
+        timeoutId = setTimeout(mountNext, 32);
+      }
+    };
+    scheduleNext();
+    return () => {
+      cancelled = true;
+      if (idleId !== null) window.cancelIdleCallback(idleId);
+      if (timeoutId !== null) clearTimeout(timeoutId);
+    };
+  }, [activeTabId, bucket.hydrated, deferredMountedTabIds, sessionId, tabs]);
+
+  // If a now-hidden simulator tab owned the active marker, move the persisted
+  // marker to a visible tab (or null). The simulator tab itself remains stored
+  // and returns when the plugin is enabled again.
+  //
+  // Never write while Subagents eligibility is still unknown: the projection is
+  // provisional during that window, so converging it would persist a decision
+  // taken from incomplete information and destroy the restored selection.
+  useEffect(() => {
+    if (!subagentsEligibilityKnown) return;
+    if (!bucket.hydrated || !sessionId || bucket.activeTabId === activeTabId) return;
+    void setActiveTab(sessionId, activeTabId).catch((err) => {
+      log.error('hidden simulator active-tab reconciliation failed', {
+        sessionId,
+        activeTabId,
+        err,
+      });
+    });
+  }, [activeTabId, bucket.activeTabId, bucket.hydrated, sessionId, subagentsEligibilityKnown]);
+
+  const prevTabCountRef = useRef<number | null>(null);
+  useEffect(() => {
+    prevTabCountRef.current = null;
+  }, [sessionId]);
+
+  // A bucket containing only unavailable product surfaces must not leave an
+  // empty public sidebar open. Preserve hidden state for later eligibility.
+  const hiddenOnlyCollapseRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!shellVisible) {
+      hiddenOnlyCollapseRef.current = null;
+      return;
+    }
+    const shouldCollapse =
+      bucket.hydrated &&
+      bucket.tabs.length > 0 &&
+      tabs.length === 0 &&
+      bucket.tabs.some(
+        (tab) =>
+          (tab.kind === 'ios-simulator' && !iosSimulatorPluginAvailable) ||
+          (tab.kind === 'subagents' && subagentsEligibilityKnown && !subagentsEnabled),
+      ) &&
+      prevTabCountRef.current === null;
+    if (!shouldCollapse || !sessionId) {
+      hiddenOnlyCollapseRef.current = null;
+      return;
+    }
+    if (hiddenOnlyCollapseRef.current === sessionId) return;
+    hiddenOnlyCollapseRef.current = sessionId;
+    onAllTabsClosed?.();
+  }, [
+    bucket.hydrated,
+    bucket.tabs,
+    iosSimulatorPluginAvailable,
+    subagentsEligibilityKnown,
+    subagentsEnabled,
+    onAllTabsClosed,
+    sessionId,
+    shellVisible,
+    tabs.length,
+  ]);
+
+  // 面板收束(2026-08):插件页签不再注册进右侧栏。历史会话里持久化的
+  // `ghost:*` tab 是旧形态残留,发现即静默关闭 —— 这些 kind 已无渲染方,
+  // 留着只会落到 PlaceholderBody 变成"敬请期待"的死页签。
+  useEffect(() => {
+    if (!bucket.hydrated || !sessionId) return;
+    const legacyGhostTabs = bucket.tabs.filter((tab) => tab.kind.startsWith('ghost:'));
+    if (legacyGhostTabs.length === 0) return;
+    void (async () => {
+      for (const tab of legacyGhostTabs) {
+        try {
+          await closeTab(sessionId, tab.id);
+        } catch (err) {
+          log.error('legacy ghost tab prune failed', { sessionId, tabId: tab.id, err });
+        }
+      }
+    })();
+  }, [bucket.hydrated, bucket.tabs, sessionId]);
+
+  // 关掉最后一个 tab → 通知 host 自动收起侧栏。只在 tab 数「从 >0 变 0」的转变时
+  // 触发,不是"等于 0"就触发:
+  //   - hydrated 后首帧 prev===null 不触发(区分"刚加载出来就是空"与"关到空");
+  //   - 展开一个本就 0-tab 的 session 也不会被立刻折叠,用户仍能在 EmptyState 加 tab。
+  // sessionId 变化时重置计数,避免"切到一个空 session"被误判成"关空"。
+  useEffect(() => {
+    if (!bucket.hydrated) return; // 未 hydrate 的空数组不算"关空"
+    const prev = prevTabCountRef.current;
+    prevTabCountRef.current = tabs.length;
+    if (prev !== null && prev > 0 && tabs.length === 0) {
+      onAllTabsClosed?.();
+    }
+  }, [bucket.hydrated, tabs.length, onAllTabsClosed]);
+
+  const handleAdd = useCallback(
+    (kind: TabKindId) => {
+      if (!sessionId) {
+        log.warn('handleAdd ignored: sessionId is null', { kind });
+        return;
+      }
+      if (kind === 'ios-simulator' && !iosSimulatorPluginAvailable) {
+        log.warn('handleAdd ignored: iOS Simulator plugin is unavailable');
+        return;
+      }
+      if (kind === 'subagents' && !subagentsEnabled) {
+        log.warn('handleAdd ignored: Subagents surface is unavailable for this harness');
+        return;
+      }
+      const plugin = getTabKind(kind);
+      // Plugin 未注册的 kind(早期 Phase 还没接的 web-browser / terminal):
+      // 仍允许建 tab,但 TabBody 会落到 PlaceholderBody。用户体感上点了「+」总有
+      // 反馈,只是看到"敬请期待"而不是"无变化"。
+      const initialState = plugin ? plugin.defaultState() : null;
+      // 单例 kind(当前仅 review)走 addOrFocusSingletonTab:已存在则切到现有,
+      // 否则正常 addTab。menu meta 的 singleton 字段是数据来源,目前只有 review。
+      const isSingleton = plugin?.menu?.singleton === true;
+      const action = isSingleton
+        ? addOrFocusSingletonTab(sessionId, kind, initialState)
+        : addTab(sessionId, kind, initialState);
+      void action.catch((err) => {
+        // TODO(Phase 7): toast 暴露 RIGHT_SIDEBAR_TOO_MANY_TABS / STATE_TOO_LARGE 等错误码。
+        log.error('handleAdd failed', { sessionId, kind, err });
+      });
+    },
+    [iosSimulatorPluginAvailable, sessionId, subagentsEnabled],
+  );
+
+  const handleClose = useCallback(
+    (tabId: string) => {
+      if (!sessionId) return;
+      void closeTab(sessionId, tabId).catch((err) => {
+        log.error('handleClose failed', { sessionId, tabId, err });
+      });
+    },
+    [sessionId],
+  );
+
+  const handleActivate = useCallback(
+    (tabId: string) => {
+      if (!sessionId) return;
+      void setActiveTab(sessionId, tabId).catch((err) => {
+        log.error('handleActivate failed', { sessionId, tabId, err });
+      });
+    },
+    [sessionId],
+  );
+
+  const handleReorder = useCallback(
+    (orderedIds: string[]) => {
+      if (!sessionId) return;
+      const fullOrder = mergeAvailableTabOrder(bucket.tabs, orderedIds, tabAvailability);
+      void reorderTabs(sessionId, fullOrder).catch((err) => {
+        log.error('handleReorder failed', { sessionId, orderedIds, err });
+      });
+    },
+    [bucket.tabs, sessionId, tabAvailability],
+  );
+
+  const handleCycleTab = useCallback(
+    (direction: RightTabDirection): boolean => {
+      if (!sessionId) return false;
+      // 右侧栏存在但折叠 / 单 tab 时按键语义是 no-op,仍需消费以免漏给系统菜单。
+      if (!shellVisible || tabs.length < 2) return true;
+      const activeIndex = tabs.findIndex((tab) => tab.id === activeTabId);
+      const nextIndex =
+        activeIndex < 0
+          ? direction === 'next'
+            ? 0
+            : tabs.length - 1
+          : (activeIndex + (direction === 'next' ? 1 : -1) + tabs.length) % tabs.length;
+      const nextTabId = tabs[nextIndex]?.id;
+      if (!nextTabId || nextTabId === activeTabId) return false;
+      void setActiveTab(sessionId, nextTabId).catch((err) => {
+        log.error('cycle right sidebar tab failed', { sessionId, direction, nextTabId, err });
+      });
+      return true;
+    },
+    [activeTabId, sessionId, shellVisible, tabs],
+  );
+
+  useAppShortcut('right-tab-prev', () => handleCycleTab('prev'), {
+    enabled: Boolean(sessionId),
+    stopImmediate: true,
+  });
+  useAppShortcut('right-tab-next', () => handleCycleTab('next'), {
+    enabled: Boolean(sessionId),
+    stopImmediate: true,
+  });
+
+  // 右键菜单"关闭其他":关掉除 keep 外的所有 tab。
+  // 用现有 closeTab 串行 await(避免一次 close 多个时位置 reorder 竞态);
+  // store 单 IPC 调用很轻,N=5 也只是几十 ms,Phase 7 如果要优化再加 batch close API。
+  const handleCloseOthers = useCallback(
+    async (keepTabId: string) => {
+      if (!sessionId) return;
+      const targets = tabs.filter((t) => t.id !== keepTabId).map((t) => t.id);
+      for (const tabId of targets) {
+        try {
+          await closeTab(sessionId, tabId);
+        } catch (err) {
+          log.error('handleCloseOthers: closeTab failed', { sessionId, tabId, err });
+          break; // 串行下一个失败时停止,避免连环错误
+        }
+      }
+    },
+    [sessionId, tabs],
+  );
+
+  // 右键菜单"关闭所有":关掉本 session 的全部 tab。
+  const handleCloseAll = useCallback(async () => {
+    if (!sessionId) return;
+    const targets = tabs.map((t) => t.id);
+    for (const tabId of targets) {
+      try {
+        await closeTab(sessionId, tabId);
+      } catch (err) {
+        log.error('handleCloseAll: closeTab failed', { sessionId, tabId, err });
+        break;
+      }
+    }
+  }, [sessionId, tabs]);
+
+  // popup 路由已挪到窗口级常驻模块(lib/popupRouter.ts):订阅不随 Shell 生命
+  // 周期,用户离开聊天视图 / main 端归属等待期间 route 切换都不再丢 popup。
+  // Shell 只负责两件事:确保 router 已 init(幂等,与 bridge 同款),以及把
+  // "用户正在看的 session"喂给 router 作无归属 popup 的回落目标(保留最后
+  // 已知值,Shell 卸载期间到达的 popup 仍有处可去)。
+  useEffect(() => {
+    initPopupRouter();
+  }, []);
+  useEffect(() => {
+    setPopupFallbackSession(sessionId);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    const off = window.electronAPI.onRsbBrowserCommand(({ command }) => {
+      if (command === 'right-tab-prev') {
+        handleCycleTab('prev');
+      } else if (command === 'right-tab-next') {
+        handleCycleTab('next');
+      }
+    });
+    return off;
+  }, [handleCycleTab, sessionId]);
+
+  return (
+    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
+      {unifiedTopbar ? (
+        <div
+          data-testid="right-sidebar-unified-topbar"
+          // bg 走 --panel-bg 与下方 TabBar / Body 同源(2026-07-21 用户裁决:CINDY 下
+          // globals.css 会把 .bg-[var(--panel-bg)] 统一映射到玻璃底,原 bg-content-area
+          // 是不透明灰,导致顶栏与面板体两种底色打架;其他 family 两 token 同为 surface,零变化)。
+          className="relative flex h-[46px] shrink-0 flex-none items-center border-b border-[var(--border-default)] bg-[var(--panel-bg)] px-2"
+          style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
+        >
+          {!isFullscreen && railChromeActionsHitHole && (
+            <div
+              aria-hidden
+              data-testid="right-sidebar-rail-chrome-actions-hit-hole"
+              className="absolute left-0 top-0 h-full"
+              style={
+                {
+                  width: CHROME_ACTIONS_GEOMETRY.clusterWidth,
+                  WebkitAppRegion: 'no-drag',
+                } as React.CSSProperties
+              }
+            />
+          )}
+          {railChromeActionsSpacerWidth > 0 && (
+            <div
+              aria-hidden
+              data-testid="right-sidebar-rail-chrome-actions-spacer"
+              className="h-full shrink-0"
+              style={
+                {
+                  width: railChromeActionsSpacerWidth,
+                  WebkitAppRegion: 'no-drag',
+                } as React.CSSProperties
+              }
+            />
+          )}
+          {leftChromeActionsSpacerWidth > 0 && (
+            <div
+              aria-hidden
+              data-testid="right-sidebar-left-chrome-actions-spacer"
+              className="h-full shrink-0"
+              style={
+                {
+                  width: leftChromeActionsSpacerWidth,
+                  WebkitAppRegion: 'no-drag',
+                } as React.CSSProperties
+              }
+            />
+          )}
+          {/* pillVariant="chip":pills 垂直居中的浮动 chip(完整圆角 + 四边框),
+              与「+」、右侧浮层按钮共享宿主栏水平中线(对齐 Codex)——贴底 flush
+              样式在 46px 高栏里会与居中控件错位。
+              「+」wrapper 传 h-[30px](pill 高)而非 h-full:TabStrip 根高度由
+              内容驱动,百分比高度会退化。 */}
+          <TabStrip
+            tabs={tabs}
+            activeTabId={activeTabId}
+            sessionId={sessionId}
+            onActivate={handleActivate}
+            onClose={handleClose}
+            onReorder={handleReorder}
+            onAdd={handleAdd}
+            onCloseOthers={handleCloseOthers}
+            onCloseAll={handleCloseAll}
+            pillVariant="chip"
+            addButtonWrapperClassName="h-[30px]"
+            iosSimulatorAvailable={iosSimulatorPluginAvailable}
+            subagentsAvailable={subagentsEnabled}
+          />
+          {/* 面板自属控件始终跟随面板：detach → maximize → 收起。固定唤起入口只在
+              面板收起或分离时存在；展开态不渲染无效的 show 按钮，也不预留空位。 */}
+          <div
+            data-testid="right-sidebar-topbar-actions"
+            className="flex h-full shrink-0 items-center gap-0.5"
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+          >
+            {onDetach && <RightSidebarDetach size="toolbar" onDetach={onDetach} />}
+            {onMaximize && (
+              <RightSidebarMaximize
+                size="toolbar"
+                onMaximize={onMaximize}
+                isMaximized={isMaximized}
+              />
+            )}
+            {onCloseSidebar && (
+              <RightSidebarToggle
+                size="toolbar"
+                collapsed={false}
+                onToggle={onCloseSidebar}
+                side={panelSide}
+              />
+            )}
+          </div>
+          {onShowSidebar && (panelSide === 'right' || isMaximized) && (
+            <div
+              aria-hidden
+              data-testid="right-sidebar-fixed-trigger-spacer"
+              className="pointer-events-none h-full shrink-0"
+              style={{ width: MAC_HEADER_ACTION_SPACER_PX }}
+            />
+          )}
+        </div>
+      ) : (
+        <TabBar
+          tabs={tabs}
+          activeTabId={activeTabId}
+          sessionId={sessionId}
+          onActivate={handleActivate}
+          onClose={handleClose}
+          onReorder={handleReorder}
+          onAdd={handleAdd}
+          showWindowControls={!isMac}
+          onMaximize={onMaximize}
+          onCloseSidebar={onCloseSidebar}
+          onShowSidebar={onShowSidebar}
+          panelSide={panelSide}
+          isMaximized={isMaximized}
+          onDetach={onDetach}
+          onCloseOthers={handleCloseOthers}
+          onCloseAll={handleCloseAll}
+          chromeWindowDrag={chromeWindowDrag}
+          iosSimulatorAvailable={iosSimulatorPluginAvailable}
+          subagentsAvailable={subagentsEnabled}
+        />
+      )}
+      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-[var(--panel-bg)]">
+        {/* 首次切到某 session 时 cache 尚未 hydrate(等 IPC list 回包),保留 panel
+            背景而非闪 EmptyState —— EmptyState 是"真的没 tab"的 Welcome 内容。
+            sessionId 为 null 也走这条:Shell 不显示任何内容(无激活会话)。 */}
+        {!bucket.hydrated ? null : tabs.length === 0 ? (
+          // tab 列表为空时永远渲染 EmptyState。审查页签只通过「+」dropdown 或
+          // EmptyState 的"打开审查"入口由用户主动创建。
+          <EmptyState
+            onAddFileTab={() => handleAdd('file-browser')}
+            onAddReviewTab={() => handleAdd('review')}
+            onAddSubagentsTab={() => handleAdd('subagents')}
+            onAddBackgroundTasksTab={() => handleAdd('background-tasks')}
+            subagentsAvailable={subagentsEnabled}
+            onAddBrowserTab={() => handleAdd('web-browser')}
+            onAddTerminalTab={() => handleAdd('terminal')}
+          />
+        ) : (
+          // 所有 tab 都挂载,只切换可见性(规则 7:杜绝切顶层 tab 时 plugin 内部 state /
+          // webview / 编辑器 / 文件树 expansion 全部丢失重建)。pointer-events 用
+          // `hidden` 自然 disable,visibility 状态由 onVisibilityChange 给 plugin。
+          tabs
+            .filter((tab) => tab.id === activeTabId || deferredMountedTabIds.has(tab.id))
+            .map((tab) => (
+            <PluginBodyHost
+              key={tab.id}
+              tab={tab}
+              active={tab.id === activeTabId}
+              sessionId={sessionId}
+              workdir={workdir}
+              remoteHostId={remoteHostId}
+              deviceLinkDeviceId={deviceLinkDeviceId}
+              shellVisible={shellVisible}
+              t={t}
+            />
+            ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+interface PluginBodyHostProps {
+  tab: TabState;
+  active: boolean;
+  sessionId: string | null;
+  workdir: string;
+  remoteHostId: string | null;
+  deviceLinkDeviceId?: string | null;
+  shellVisible: boolean;
+  t: ReturnType<typeof useTranslation>['t'];
+}
+
+/**
+ * 单个 tab 的 body 挂载点 —— 解析 plugin、构造 ctx、按 active 切换可见性。
+ *
+ * 一个 PluginBodyHost 实例的生命周期 = 一个 tab 的生命周期(Shell 不卸载内部 plugin
+ * 子树),内部 state(如 file tree expansion / webview content)切顶层 tab 不丢。
+ *
+ * sessionId 为 null 时 host 也已经在上层 short-circuit 到 EmptyState,不会跑到这里;
+ * 但类型上 ctx.sessionId 是 string,需断言。
+ */
+function PluginBodyHost({
+  tab,
+  active,
+  sessionId,
+  workdir,
+  remoteHostId,
+  deviceLinkDeviceId,
+  shellVisible,
+  t,
+}: PluginBodyHostProps) {
+  const plugin = getTabKind(tab.kind);
+
+  // 构造 plugin host ctx。patchState 通过 store.patchTabState 走 store + IPC,
+  // 失败回滚。useCallback dep 锁 sessionId + tab.id,plugin 内部 useEffect 监听 ctx
+  // identity 才不会无意义重跑。
+  //
+  // onVisibilityChange v1 仅作占位钩子(plugin 自检 active 与否的辅助通道,Phase 4
+  // webview 加 mute 时再消费)。
+  const ctx = useMemo<TabKindHostContext>(
+    () => ({
+      tabId: tab.id,
+      sessionId: sessionId ?? '',
+      workdir,
+      remoteHostId,
+      deviceLinkDeviceId,
+      patchState: (patch: unknown) => {
+        if (!sessionId) return;
+        void patchTabState(sessionId, tab.id, (current) => {
+          // 默认对象浅合并语义。plugin 想完全替换可传 fn-style;但这里 ctx 接口固定
+          // 是 patch object,plugin 调用方负责传可序列化的部分 state diff。
+          if (
+            current &&
+            typeof current === 'object' &&
+            patch &&
+            typeof patch === 'object' &&
+            !Array.isArray(current) &&
+            !Array.isArray(patch)
+          ) {
+            return { ...current, ...patch };
+          }
+          return patch;
+        }).catch((err) => {
+          log.error('patchState failed', { sessionId, tabId: tab.id, err });
+        });
+      },
+      onVisibilityChange: () => {
+        // Phase 4/5 真消费(webview mute / 暂停媒体);v1 noop。
+      },
+      setCloseInterceptor: (interceptor) => setTabCloseInterceptor(tab.id, interceptor),
+    }),
+    [sessionId, workdir, remoteHostId, deviceLinkDeviceId, tab.id],
+  );
+
+  // active 切换:走 effect 通知 plugin(plugin 自己内部用 ctx.onVisibilityChange
+  // 时机控制媒体 / 焦点)。
+  useEffect(() => {
+    ctx.onVisibilityChange(active && shellVisible);
+  }, [active, ctx, shellVisible]);
+
+  // 规范化 raw state → plugin state:Phase 2 创的旧 tab 持久化是 null,plugin
+  // 直接 `state.xxx` 会 NPE。走 hydrateTabState helper(优先 plugin.hydrateState,
+  // 否则 null → defaultState 兜底)。TabBar 渲染 TabPill 时也走同一 helper,保证
+  // body / pill 两边看到的 state 形状一致。
+  const hydratedState = useMemo(() => hydrateTabState(plugin, tab.state), [plugin, tab.state]);
+
+  return (
+    <div
+      className={active ? 'flex min-h-0 flex-1 flex-col overflow-hidden' : 'hidden'}
+      aria-hidden={!active || undefined}
+    >
+      {plugin ? (
+        <TabBodyErrorBoundary tabId={tab.id} tabKind={tab.kind} t={t}>
+          <Suspense fallback={null}>
+            <plugin.TabBody
+              state={hydratedState}
+              ctx={ctx}
+              active={active}
+              shellVisible={shellVisible}
+            />
+          </Suspense>
+        </TabBodyErrorBoundary>
+      ) : (
+        <PlaceholderBody tab={tab} t={t} />
+      )}
+    </div>
+  );
+}
+
+/** Plugin 未注册的兜底。 */
+function PlaceholderBody({ tab, t }: { tab: TabState; t: ReturnType<typeof useTranslation>['t'] }) {
+  return (
+    <div className="flex flex-1 items-center justify-center text-12 text-[var(--text-tertiary)]">
+      <span>{t('rightSidebar.tabs.placeholderHint', { kind: tab.kind })}</span>
+    </div>
+  );
+}

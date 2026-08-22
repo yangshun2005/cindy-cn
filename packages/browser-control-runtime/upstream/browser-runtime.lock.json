@@ -1,0 +1,46 @@
+{
+  "source": {
+    "repo": "https://github.com/openclaw/openclaw",
+    "path": "extensions/browser",
+    "commit": "b972feb3f791ed38dafc27c1961dc87f2e30b210",
+    "license": "MIT"
+  },
+  "strategy": "sync-core-runtime-with-neutral-adapter",
+  "generated": true,
+  "notes": [
+    "Product-facing package and tool names remain neutral.",
+    "Keep legal/source attribution in this metadata and third-party notices when runtime code is synced.",
+    "Do not edit generated runtime sources directly (src/_generated/**); update sync.mjs or src/shim/* instead.",
+    "Full extraction live: core + leaf SSRF/security + net-policy + normalization-core + fs-safe dist, with hand-written src/shim/* for the plugin-sdk surface."
+  ],
+  "patches": [
+    {
+      "file": "extension/src/browser/chrome.executables.ts",
+      "desc": "detect macOS Google Chrome Beta after stable Chromium-family browsers"
+    },
+    {
+      "file": "extension/src/browser/chrome.executables.ts",
+      "desc": "classify macOS Google Chrome Beta within the Chrome-only fallback"
+    },
+    {
+      "file": "extension/src/browser/config.ts",
+      "desc": "preserve narrow fake-IP SSRF allowances from the host config without enabling general private-network access"
+    },
+    {
+      "file": "extension/src/browser/config.ts",
+      "desc": "skip upstream auto-injected \"openclaw\"/\"user\" profiles when the host provides its own (avoids CDP port 18800 collision with the managed profile + never drives the user's Chrome)"
+    }
+  ],
+  "fileCount": 335,
+  "contentHash": "ec71c1f65b7239df32b0e861d8ac55a1dc55747487dae4fcf1ea4d16002c02ec",
+  "fsSafe": {
+    "package": "@openclaw/fs-safe",
+    "version": "0.4.0"
+  },
+  "counts": {
+    "core": 133,
+    "packages": 10,
+    "leaf": 14,
+    "fsSafe": 178
+  }
+}

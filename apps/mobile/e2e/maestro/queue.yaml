@@ -1,0 +1,93 @@
+appId: ${APP_ID}
+---
+- assertVisible:
+    id: "session.screen"
+# 排队消息是消息流中的 pending_send 项:轻点包含状态徽标的气泡展开操作行。
+- extendedWaitUntil:
+    visible:
+      id: "pendingSend.bubble.mock-queue-1"
+    timeout: 10000
+- tapOn:
+    id: "pendingSend.bubble.mock-queue-1"
+- extendedWaitUntil:
+    visible:
+      id: "pendingSend.actions.mock-queue-1"
+    timeout: 10000
+- tapOn:
+    id: "pendingSend.edit.mock-queue-1"
+- extendedWaitUntil:
+    visible:
+      id: "session.queueEditBar"
+    timeout: 10000
+- tapOn:
+    id: "session.composerInput"
+- eraseText
+- inputText: "First queue edit"
+- hideKeyboard
+- tapOn:
+    id: "session.sendButton"
+- extendedWaitUntil:
+    notVisible:
+      id: "session.queueEditBar"
+    timeout: 10000
+- tapOn:
+    id: "pendingSend.bubble.mock-queue-1"
+- extendedWaitUntil:
+    visible:
+      id: "pendingSend.actions.mock-queue-1"
+    timeout: 10000
+- tapOn:
+    id: "pendingSend.edit.mock-queue-1"
+- extendedWaitUntil:
+    visible:
+      id: "session.queueEditBar"
+    timeout: 10000
+- tapOn:
+    id: "session.composerInput"
+- eraseText
+- inputText: "Second queue edit"
+- hideKeyboard
+- tapOn:
+    id: "session.sendButton"
+- extendedWaitUntil:
+    visible: "Second queue edit"
+    timeout: 10000
+- extendedWaitUntil:
+    notVisible:
+      id: "session.queueEditBar"
+    timeout: 10000
+- tapOn:
+    id: "pendingSend.bubble.mock-queue-1"
+- extendedWaitUntil:
+    visible:
+      id: "pendingSend.actions.mock-queue-1"
+    timeout: 10000
+- tapOn:
+    id: "pendingSend.edit.mock-queue-1"
+- extendedWaitUntil:
+    visible:
+      id: "session.queueEditBar"
+    timeout: 10000
+- tapOn:
+    id: "session.queueEditCancel"
+- extendedWaitUntil:
+    notVisible:
+      id: "session.queueEditBar"
+    timeout: 10000
+- tapOn:
+    id: "pendingSend.badge.queued"
+- extendedWaitUntil:
+    visible:
+      id: "pendingSend.actions.mock-queue-1"
+    timeout: 10000
+- tapOn:
+    id: "pendingSend.steer.mock-queue-1"
+- extendedWaitUntil:
+    notVisible:
+      id: "pendingSend.bubble.mock-queue-1"
+    timeout: 10000
+- extendedWaitUntil:
+    visible: "Mock desktop received: Second queue edit"
+    timeout: 10000
+- assertVisible:
+    id: "session.screen"

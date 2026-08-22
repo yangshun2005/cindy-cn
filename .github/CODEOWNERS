@@ -1,0 +1,7 @@
+# 默认所有路径由维护者团队 review。
+#
+# 生效前提（缺一条 GitHub 就静默跳过该 owner，不报错）：
+#   - team 必须真实存在于 makecindy 组织下，slug 与此处一致；
+#   - 该 team 必须对本仓库有 write 及以上权限；
+# 组织级设置见 https://github.com/orgs/makecindy/teams
+* @makecindy/maintainers

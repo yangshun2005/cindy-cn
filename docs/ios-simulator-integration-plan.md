@@ -1,0 +1,54 @@
+# Cindy Desktop iOS 模拟器集成计划
+
+> 状态：Phase 0 已完成；Phase 1 主链路与协同 UI 已落地；Phase 2/3 的可自动验证基础设施、shutdown/WDA 恢复、退出 fail-closed、archived 回收、多实例独立 tile 操作和 simctl 设备状态工具已落地。
+>
+> Phase 4A 已完成进程托管与 capability probe：可组合 driver contract、capability router/report、5-byte framed protocol、`IOSSimulatorNativeSidecarAdapter`、有界 stdio channel、崩溃预算/parked/re-arm、最小环境、握手校验和 CoreSimulator/SimulatorKit 探测已落地。Phase 4B 已实现精确 UDID 的 IOSurface 单帧 capture、有界逐帧确认 BGRA correctness stream、VideoToolbox 硬件 H.264 Annex-B producer、`configureStream` / `startStream` 产品 operation、vImage 缩放/方向变换、Main 到 Renderer 的 capability-gated transport、真实 Electron 生产 WebCodecs decoder reset/recovery、30 分钟长稳和四实例资源/降档门禁，以及 native 断流后 MJPEG 接管和显式 re-arm。Phase 4C 已实现精确设备的连续单指/双指 HID、Abort/takeover/detach/SIGKILL 后的触点释放，以及 MCP `touch_path` / `touch2_path`。Phase 4D-1 已建立 Xcode/runtime/architecture compatibility matrix；Phase 4D-2 已建立 host-owned runtime capability admission，分离 requested、compatible、detected、admitted 与 active，并对 artifact trust、资源门禁和 parked 状态 fail-closed；Phase 4D-3 已把启动中止、WDA/Sidecar 联合停止、Session stale binding、设备 shutdown、orphan reconcile 与 Desktop quit 收敛到现有 owner/shutdown gate；Phase 4D-4 已接入 macOS deny-by-default OS sandbox、最小环境与每实例临时目录回收，并完成真实 framebuffer/H.264/HID 沙箱门禁。Phase 4E 已新增 Host-owned capability provider、artifact resolver、admission policy 与 supervisor 边界，当前内置 Sidecar 已迁移为默认 provider，未来插件只能提供 artifact 候选，不能直接启动或接管 Sidecar。Phase 4F-1 已把正式分发 artifact 收敛为 Cindy 内置后台 Helper bundle；Phase 4F-2 已接入 Helper 内外层签名顺序、Hardened Runtime、主 App 封印的 identity manifest、packaged artifact 验证与每次启动前摘要复验；Phase 4F-3 已把正式包的原生能力提升接入 Host-owned 精确 release registry；Phase 4F-4 已新增最终签名/公证后的 packaged release gate，默认验证信任链、精确 compatibility 与 fail-closed fallback，受控发布环境可显式运行临时设备的 H.264/HID/restart 黑盒门禁。当前产品运行时采用“known-good 直接启用、unknown 默认尝试并等待 Sidecar probe、known-bad 硬拒绝并回退 WDA/MJPEG”的策略；发布 gate 仍独立要求 exact eligible。面板会分别显示实际 H.264/HID route 与 detecting/fallback/reconnecting/unavailable 状态。系统 bezel 手势、真实发布证书环境的 native gate、差异图像导出和最终手动验收仍需后续迭代。
+>
+> 关联 Issue：[#397](https://github.com/xindong/cindy-moved/issues/397)
+>
+> 适用平台：macOS
+>
+> 更新时间：2026-08-13
+
+## 0. 当前实施状态
+
+截至 2026-07-25，已完成以下可进入产品集成验证的生产路径：
+
+- 新增 host-neutral `@cindy/ios-simulator-runtime`，通过 argv 方式调用 Apple 工具并解析 `simctl list -j`，不执行 shell。
+- Desktop main 以真实 Session 记录为准，local macOS 会话可发现环境；缺失、已删除、SSH/remote Session 均 fail-closed。
+- 新增默认启用、允许用户或项目显式关闭的 `cindy_ios_simulator` Agent provider，已经覆盖环境/设备/实例生命周期、screen map、基础输入、App build/install/launch/terminate/open URL、截图录屏和诊断工具。这样 iOS 请求可直接进入内嵌流程，而无需用户先为每个项目手动开启插件。
+- 内嵌与外部模拟器的路线选择由插件 Skill/Agent 负责：内嵌能力可用且适合任务时优先使用 `cindy_ios_simulator`，不可用或用户需要系统窗口时可以走普通 shell、Xcode、Simulator.app、`simctl` 或 Computer Use。Desktop 不再注入 iOS 专用 shell policy、Claude hook 或 Codex PATH shim；外部命令继续服从 Agent 原有权限与审批机制。
+- Computer MCP 不再对 Xcode/Simulator.app 设置 iOS 专用路由硬闸；启动、点击、快捷键和轨迹回放均走普通桌面驱动。工作目录路径边界、窗口快照代际、轨迹不可变预检、取消与执行预算等通用安全保护保持不变。内嵌 Host 的 session ownership、generation、lease、设备准入、跨任务隔离与 cleanup 仍由 Host 强制执行，不依赖 Skill 自觉。
+- 新增非 singleton 的 `ios-simulator` right-sidebar plugin；用户可手动打开、attach、启动/停止/解绑设备、管理 Agent 设备授权，并查看 main 内存中的实时 JPEG stream 与 FPS/连接状态。
+- manual pane 与 Agent tool gate 分离：关闭实验性 Agent tool 不影响用户查看本机设备状态。
+- 已覆盖 runtime parser、MCP envelope/session context、main host/IPC、远程会话拒绝、renderer 状态展示和 plugin provider 映射测试。
+- 新增 host-neutral automation driver 契约、WDA source pin、checkout inspection、build/launch argv plan、loopback-only HTTP client 和 bounded MJPEG parser；driver 已拆成 semantic、discrete input、JPEG stream 能力面，WDA 保持默认实现。
+- 新增 capability router/report、5-byte bounded sidecar protocol、按精确 UDID/generation 绑定的 `IOSSimulatorNativeSidecarAdapter` 和 native process manager；native executable 已开放只读单帧 correctness capture、H.264 产品连续流和连续 HID。Development 与 packaged 运行时都默认按能力尝试 Native；兼容矩阵 `unknown` 只进入 probation/handshake，不再阻止 Sidecar 启动，明确不兼容、artifact 不可信、资源拒绝或进程 parked 仍硬拒绝并回退 WDA/MJPEG。`CINDY_IOS_SIMULATOR_NATIVE_H264=0` / `CINDY_IOS_SIMULATOR_NATIVE_HID=0` 仍可作为开发诊断关闭开关。BGRA 产品流固定关闭。
+- native process manager 已实现 argv-only 绝对路径启动、POSIX process-group kill、最小环境变量白名单、协议/能力/UDID/generation handshake、availability probe、实例级 stop，以及同 identity 的 restart/re-arm；WDA manager 可在不重启 WDA session 或 simulator 的前提下重新握手、probe 并原子替换 capability router，失败仍只保留 MJPEG fallback。
+- Native Sidecar 与 WDA process manager 的 `stop()` 现在会确定性等待同 instance 的 in-flight start/recover：stop 先让已创建 channel 进入 stopped 并中止 pending request，晚到的 handshake/availability/restart 不会重新写回 running binding；重复 stop 共用同一收敛操作。WDA owner 同样等待正在 build/start 的 operation，完成后删除 session、结束 WDA 和 Sidecar，不把晚到子进程留给 Desktop quit。
+- WDA controller 与 Simulator 内独立 Runner 共享由 profile、instance 和精确 UDID 推导的非敏感 owner fingerprint。Main 被 `SIGKILL` 后，新 Host 会先用无环境变量的进程清单筛出精确候选，再只读取候选 Runner 的 owner 标记并回收对应进程组；无法证明归属的同设备 WDA 不会被终止，也会阻止 Cindy 启动第二套 WDA。归档与删除任务都会在启动恢复中重试 runtime quiescence，但只有删除任务会移除媒体引用。
+- macOS-only sidecar executable 已实现精确 UDID 设备查找、0～16 有界 screen ID discovery、`IOSurfaceLock(.readOnly)`、BGRA pixel format/尺寸/stride/byte limit 校验和立即复制解锁；单帧通过现有 `StreamFrame`/`StreamEnd` 传输，不新增网络端口或持久媒体旁路。
+- arm64 与 x86_64 分别使用最小 ABI shim 调用 private Swift getter，显式满足其 method-self 寄存器约定，不依赖优化器偶然分配；`native:build` 生成架构专属 sidecar 并清理中间 object。
+- sidecar handshake 会报告 sanitized `framebufferSymbols`、`framebufferCapture` 和 width/height/bytesPerRow/byteCount/screenId/pixelFormat；framework 路径、IOSurface 句柄和原始 stderr 不进入 renderer/Agent diagnostics。
+- `captureNativeFrame()` 是独立的 correctness API，不受 `bgraStream` capability 控制；正式 `h264Stream` 只有在 sidecar 收到 `--enable-h264-stream` 且 framebuffer ready 时为 true，`continuousInput` / `multiTouch` 只有在收到 `--enable-continuous-input` 且精确设备 HID client 初始化成功后为 true，`bgraStream` 始终为 false。Host 默认发放 probe 请求，Sidecar handshake 才能把单项能力提升为 active；开发环境变量仅保留 `0` 的显式关闭语义。packaged/release 仍由 artifact trust、资源策略和 release gate 共同约束，renderer、Agent、插件或 Sidecar 自报都不能绕过 Host admission。
+- Phase 4C 在 Xcode 26.4 使用 `IndigoHIDMessageForMouseNSEvent` 构造 digitizer 消息，并通过 `_TtC12SimulatorKit24SimDeviceLegacyHIDClient` 的 `initWithDevice:error:` / `sendWithMessage:freeWhenDone:completionQueue:completion:` 发往精确 UDID。实际 ABI 使用 point1、可选 point2、target、event type、设备尺寸和 edge；双指由同一消息的第二个可选 point 表达，不拆成两个并发单指请求。
+- native gesture 只接受 0～1 normalized 坐标、最多 4096 个 sample、最长 60 秒和至少 4 ms 的 move 间隔；双指路径必须 sample 数、phase 与 timing 完全同步，且不接受 system-edge 参数。Desktop 从 WDA viewport metadata 把设备 point 坐标归一化，不使用 renderer DOM 尺寸猜测坐标。
+- `tap`、`type_text`、`press_home` 和 accessibility/screen map 继续由 WDA 负责；`swipe` 仅在 native continuous input capability 可用时走原生路径，否则保留 WDA fallback。显式 `touch_path` / `touch2_path` 不做部分执行后的 replay fallback，避免重复手势。
+- 所有 native HID tool 继续经过 Session ownership、per-device grant、generation/lease route、accessibility snapshot、instance actor mutation serialization、busy/takeover gate。用户 takeover 会 Abort 活动 Agent gesture；正常 stop 先 `detach`，Abort 发 `stopStream`，sidecar 异常路径补发 release，同 identity SIGKILL recovery 在重新握手后发送 stale-contact release。
+- `streamNativeBgraCorrectnessFrames()` 提供 1～15 FPS、1～900 帧、单帧 hard byte limit 的内部稳定性门禁；sidecar 同时只接受一条 correctness stream，每帧必须等 host callback 完成并确认后才继续采集，慢消费者不会形成无界 native/Node 队列。
+- `streamNativeH264CorrectnessFrames()` 提供 1～30 FPS、1～900 帧的内部 producer 门禁：每帧把只读 IOSurface 快照逐行复制到 BGRA `CVPixelBuffer`，交给 realtime hardware-only VideoToolbox session 编码，再把 AVCC NAL 转成 Annex-B；首帧、分辨率重建帧和周期帧强制关键帧，关键 access unit 前注入 SPS/PPS。该 API 与 BGRA correctness stream 共用单流仲裁、逐帧 ACK、连续 sequence、abort 和 hard byte limit，不受正式 `h264Stream` capability 控制。
+- Renderer 已新增独立 `IOSSimulatorH264Decoder`：解析 Annex-B，并把 4-byte length-prefixed access unit 规范化为 Annex-B；从 SPS 推导 `avc1` codec，使用 `prefer-hardware` / `optimizeForLatency` WebCodecs 配置，首个关键帧必须携带 SPS/PPS。generation、尺寸或 decoder error 会关闭旧 decoder 并等待新关键帧，旧 generation output 和 unmount 后 output 会立即 `VideoFrame.close()`。
+- Decoder 已实现有界失败策略：WebCodecs 缺失、不支持的配置、持续缺少关键帧或连续 decoder error 只触发一次 MJPEG fallback；控制器不清空调用方当前 canvas/JPEG，因此 pane 会保留最后画面直到 MJPEG 首帧接管，避免切换白屏。真实 Electron 门禁已使用隐藏且 sandboxed 的本地 Renderer、strict CSP、无 preload/Node 权限的 Chromium `VideoDecoder` 完成 1 帧与 5 帧产品流解码；access unit 入队后立即确认，流末统一 `flush()`，避免逐帧 flush 破坏 P 帧依赖或把 sidecar ACK 错绑到 decoder 内部缓存。
+- Main 已新增独立 `IOSSimulatorH264FramePump`：只接受 capability router 选中的 native driver，先配置 H.264 profile，再保留一个最新 access unit；profile/generation/driver 切换会 abort 旧流并等待旧任务退出后启动新流，避免同 sidecar 双流竞争，同 generation 切换 driver/profile 时保持 host sequence 单调。默认 payload 上限从 16 MiB protocol body 扣除 4-byte 前缀与 64 KiB metadata，并由 protocol、adapter 和 pump 共用同一常量。Renderer IPC 只获得复制后的 H.264 bytes 与 sanitized frame metadata。
+- SimulatorKit 暴露的是固定物理 portrait IOSurface，设备 UI orientation 不会通过 surface 尺寸变化表达。产品 profile 因此由已授权的 WDA host 同步传入 `PORTRAIT` / `LANDSCAPE`；landscape 在 VideoToolbox 前通过 vImage 顺时针旋转 90°，profile 切换会重建 encoder 并强制首帧 IDR。真实临时设备已完成 portrait 602×1310 → landscape 1310×602 → portrait 602×1310，三段首帧均为关键帧，设备与进程均在 `finally` 清理。
+- 详情 pane 在 WebCodecs 可用时请求 H.264，并用常驻 canvas 绘制；首个 H.264 output 成功前继续保留当前 JPEG，decoder fallback 会通过同一 viewer lease 明确请求 JPEG。多实例 grid 显式固定 JPEG，避免为后台 tile 创建多个 decoder。Main 若观察到 native stream disconnected，会自动停掉 H.264 pump 并启动 WDA/MJPEG；用户下一次显示请求会对 unavailable/parked sidecar 做显式 re-arm，而 capability 存在但不支持 H.264 的 packaged 路径不会反复重启。
+- persisted ownership reconcile 对 missing/deleted/archived Session 和已 shutdown/丢失的设备先停止 frame pump、录屏、WDA 与 Sidecar，再按 creation/boot provenance 决定是否 shutdown/delete 设备；driver runtime 停止失败时保留 degraded ownership 供下次重试，不继续修改设备。外部 preexisting 设备仍不被 shutdown/delete。
+- correctness stream 每帧重新读取当前 IOSurface，并重新生成 width/height/bytesPerRow/orientation metadata；sequence 必须从 0 严格连续，UDID/generation 固定。显式 abort 会唤醒等待中的 producer、输出确定性 stream end，stdout 由单一锁串行写入，避免 reply/frame 字节交错。
+- Phase 4B 已冻结 native frame contract：H.264 必须声明 Annex-B 或 4-byte length-prefixed 格式，校验 NAL 边界、NAL type 与 IDR keyframe 标记；BGRA 校验 stride、尺寸和字节数。native channel 在交付 callback 前执行同一套校验，异常只终止当前 stream 并保留 WDA fallback。
+- native frame metadata 已固定 orientation、scale 和 color space 字段；其合法性与尺寸约束在 protocol decode、channel 交付和 queue enqueue 三层保持一致，为后续方向/尺寸变化与坐标转换保留确定性输入。
+- native stream consumer 已接入有界 latest-frame queue：sidecar callback 只复制并入队，慢 renderer 会丢弃旧帧而不积压 native bytes，并返回 depth、byteCount、droppedFrames、droppedBytes 统计；队列中的 transient frame 不写入媒体总仓。
+- 已在本机 Xcode 26.4 + iOS 26.1 + WDA v15.1.6 完成 build/launch、status、session、accessibility source 和 3 帧 MJPEG client smoke。
+- 已在独立创建且验证后删除的 iOS 26.4 临时 simulator 上完成 tap、type、swipe、Home 和 orientation mutation smoke；未操作用户已有设备。
+- 已完成单实例 30 分钟 MJPEG 稳定性测试和受控 WDA stop/restart：无 silent stall，服务端 EOF 可确定识别，重启后 status/accessibility/session/stream 均恢复。
+- 已完成 1/2/4 台 iOS 26.4 simulator 的稳态 MJPEG 资源基准：每路约 4.60-4.62 FPS、0.60-0.61 MiB/s；四路合计 18.42 FPS、2.42 MiB/s，未发生提前 EOF。
+- 已用 macOS `footprint`
