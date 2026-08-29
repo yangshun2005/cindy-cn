@@ -33,7 +33,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "eventsource-parser": "^3.0.6",
     "google-auth-library": "^10.6.2",
-    "sharp": "^0.35.0",
+    "sharp": "^0.35.4",
     "zod": "^4.0.0"
   },
   "devDependencies": {
